@@ -11,6 +11,8 @@ representations (B, H, L, L, D), and a bias term over
 the attention weights, through which we wish to
 propagate gradients.
 
+NOTE: As of 2025-02-24, only the forward pass is implemented.
+
 ### Input Format
 - Query (Q): `(Batch, Heads, L1, L2, Dims)`
 - Key (K): `(Batch, Heads, L1, L2, Dims)`

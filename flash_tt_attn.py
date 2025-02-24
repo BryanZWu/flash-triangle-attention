@@ -43,9 +43,6 @@ def is_hip():
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
-print("TMA benchmarks will be running without grid constant TMA descriptor.")
-
-
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,
                     K_block_ptr, V_block_ptr, B_pw_block_ptr,
@@ -263,18 +260,6 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
     m_ptrs = M + off_bh * L + offs_ql2
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
-
-
-
-configs_tma = [
-    triton.Config({'BLOCK_QL2': B_QL2, 'BLOCK_KL2': B_KL2}, num_stages=s, num_warps=w) \
-    for B_QL2 in [64, 128]\
-    for B_KL2 in [32, 64, 128]\
-    for s in [2, 3, 4, 6]\
-    for w in [4, 8]\
-]
-
-
 
 class _attention(torch.autograd.Function):
     @staticmethod
