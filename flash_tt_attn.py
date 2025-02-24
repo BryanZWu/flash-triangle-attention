@@ -523,4 +523,4 @@ if __name__ == "__main__":
     test_op(Z=2, H=4, L=128, HEAD_DIM=32, dtype=torch.float16)
 
     # Run benchmarks
-    bench_attention.run(save_path=".", print_data=True)
+    bench_attention.run(save_path="test_results/", print_data=True)
