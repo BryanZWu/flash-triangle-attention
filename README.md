@@ -11,10 +11,6 @@ representations (B, H, L, L, D), and a bias term over
 the attention weights, through which we wish to
 propagate gradients.
 
-NOTE: As of 2025-03-02, there remains a bug in the backward pass--
-query and bias gradients are not being computed correctly after the 
-first 128 tokens.
-
 ### Input Format
 - Query (Q): `(Batch, Heads, L1, L2, Dims)`
 - Key (K): `(Batch, Heads, L1, L2, Dims)`
@@ -39,11 +35,19 @@ Benchmarked on an NVIDIA L4 GPU with the following parameters:
 - Head Dimension: 32
 
 ### Memory Usage
-![Memory Usage](test_results/fused-attention-batch4-head8-d32-fwd-memory.png)
+#### Forward pass
+![Forward Pass Memory Usage](test_results/fused-attention-batch4-head8-d32-fwd-memory.png)
+
+#### Backward pass
+![Backward Pass Memory Usage](test_results/fused-attention-batch4-head8-d32-bwd-memory.png)
 
 ### Latency
-![Latency](test_results/fused-attention-batch4-head8-d32-fwd-latency.png)
 
+#### Forward pass
+![Forward Pass Latency](test_results/fused-attention-batch4-head8-d32-fwd-latency.png)
+
+#### Backward pass
+![Backward Pass Latency](test_results/fused-attention-batch4-head8-d32-bwd-latency.png)
 ## Usage
 
 See [example_usage.py](example_usage.py) for a simple example of how to use the implementation.
