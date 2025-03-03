@@ -11,7 +11,9 @@ representations (B, H, L, L, D), and a bias term over
 the attention weights, through which we wish to
 propagate gradients.
 
-NOTE: As of 2025-02-24, only the forward pass is implemented.
+NOTE: As of 2025-03-02, there remains a bug in the backward pass--
+query and bias gradients are not being computed correctly after the 
+first 128 tokens.
 
 ### Input Format
 - Query (Q): `(Batch, Heads, L1, L2, Dims)`

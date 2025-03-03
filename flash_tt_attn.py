@@ -22,7 +22,7 @@ Tensors:
     - K: (B, H, KN1, KL2, D) Key
     - V: (B, H, KN1, KL2, D) Value
     - B_pw: (B, H, KN1, KL2) PW Bias
-    - M: (B, H, QL1, QL2) Max values
+    - Logsumexp: (B, H, QL1, QL2) Logsumexp values
     - O: (B, H, QL1, QL2, D) Output
 '''
 
@@ -34,6 +34,9 @@ import triton
 import triton.language as tl
 
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+INV_LN2: tl.constexpr = 1.4426950408889634  # = 1/ln(2)
+LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
 # Helper function to check if we're using HIP (AMD) backend
 def is_hip():
@@ -124,7 +127,7 @@ def keep(conf):
 
 @triton.autotune(list(filter(keep, configs)), key=["L", "D"])
 @triton.jit
-def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for softmax, M: max values, Out: output tensor
+def _attn_fwd(Q, K, V, B_pw, sm_scale, Logsumexp, Out,  # sm_scale: scaling factor for softmax, Logsumexp: logsumexp values, Out: output tensor
               stride_qb, stride_qh, stride_ql1, stride_ql2, stride_qd,  # Strides for Q tensor: batch, head, seq_len, seq_len, head_dim
               stride_kb, stride_kh, stride_kl1, stride_kl2, stride_kd,  # Strides for K tensor
               stride_vb, stride_vh, stride_vl1, stride_vl2, stride_vd,  # Strides for V tensor
@@ -153,8 +156,7 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
 
     Of these, step 3 is not handled by out-of-the-box flash attention.
     """
-    # Ensure block size doesn't exceed head dimension
-    tl.static_assert(BLOCK_KL2 <= D, "Block size (BLOCK_KL2) must not exceed head dimension (D)")
+    tl.static_assert(BLOCK_KL2 <= D, f"Block size (BLOCK_KL2) must not exceed head dimension (D)--expected {BLOCK_KL2} <= {D}")
 
     # Grid dimension explanation:
     # - program_id(0): Indexes along inner sequence length (L/BLOCK_QL2 blocks)
@@ -237,7 +239,7 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
     acc = tl.zeros([BLOCK_QL2, D], dtype=tl.float32)      # Accumulated attention outputs
 
     pre_bias_qk_scale = sm_scale # 1/sqrt(head_dim)
-    post_bias_qk_scale = 1.44269504 # 1/log(2), to account for log2 in softmax
+    post_bias_qk_scale = INV_LN2 # 1/log(2), to account for log2 in softmax
 
     # Load query block - remains in SRAM throughout computation
     q = tl.load(Q_block_ptr)
@@ -257,9 +259,298 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
     # 2. Normalize softmax by dividing by denominator
     acc = acc / l_i[:, None]
     # 3. Store outputs
-    m_ptrs = M + off_bh * L + offs_ql2
-    tl.store(m_ptrs, m_i)
+    lse_ptrs = Logsumexp + off_bh * L * L + off_l1 * L + offs_ql2
+    tl.store(lse_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+
+@triton.jit
+def _attn_bwd_preprocess(O, DO,  #
+                         O_DO,  #
+                         B, H, L,  #
+                         BLOCK_QL2: tl.constexpr, D: tl.constexpr,  #
+                         ):
+    """
+    Computes (O * DO).sum(axis=-1).
+    """
+    # Calculate offsets for the current block
+    off_ql2 = tl.program_id(0) * BLOCK_QL2 + tl.arange(0, BLOCK_QL2)
+    off_bhql1 = tl.program_id(1)
+    off_d = tl.arange(0, D)
+
+    # Load output and gradient tensors
+    o = tl.load(O + off_bhql1 * L * D + off_ql2[:, None] * D + off_d[None, :])
+    do = tl.load(DO + off_bhql1 * L * D + off_ql2[:, None] * D + off_d[None, :]).to(tl.float32)
+
+    # Compute delta values (dot product of output and gradient)
+    o_do = tl.sum(o * do, axis=1)
+
+    # Store computed deltas
+    tl.store(O_DO + off_bhql1 * L + off_ql2, o_do)
+
+@triton.jit
+def _attn_bwd_dkdv(dk, dv,  #
+                   Q, k, v, B_pwT_dkdv_start, sm_scale,  #
+                   DO,  #
+                   Logsumexp, D,  #
+                   stride_l2, stride_d,  #
+                   stride_b_pw_l1, stride_b_pw_l2,  #
+                   H, L, BLOCK_QL2: tl.constexpr,  #
+                   BLOCK_KL2: tl.constexpr,  #
+                   HEAD_DIM: tl.constexpr,  #
+                ):
+    """
+    Computes gradients with respect to keys (dk) and values (dv)--each warp/program
+    loops over the Q dimension, and accumulates dkdv in sram.
+    dk, dv, k, v are SRAM tensors.
+    Q, DO, B_pw are in HBM.
+    
+    (Note that we loop over Q, which corresponds to b_pw_l1)
+    """
+    # Initialize offsets for the current block--this is the shared between the 1d and 2d tensors
+    offs_ql2 = tl.arange(0, BLOCK_QL2)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    # Ensure block sizes are compatible
+    tl.static_assert(BLOCK_KL2 % BLOCK_QL2 == 0)
+
+    # Initialize tracking variables
+    curr_ql2 = 0
+    step_ql2 = BLOCK_QL2
+
+
+    # Setup pointers for Q and DO tensors
+    qT_ptrs = Q + offs_ql2[None, :] * stride_l2 + offs_d[:, None] * stride_d
+    do_ptrs = DO + offs_ql2[:, None] * stride_l2 + offs_d[None, :] * stride_d
+    b_pw_ptrs = B_pwT_dkdv_start + offs_ql2[None, :] * stride_b_pw_l1 
+
+    # Process blocks to compute gradients
+    while curr_ql2 < L:
+        # For the 1d tensors the stride is just 1
+        offs_ql2_1d = curr_ql2 + offs_ql2
+        
+        # Load all values
+        lse = tl.load(Logsumexp + offs_ql2_1d)
+        qT = tl.load(qT_ptrs)
+        b_pwT = tl.load(b_pw_ptrs)
+        Di = tl.load(D + offs_ql2_1d)
+
+        # Rematerialize attention score in sram/registers
+        qkT = tl.dot(k, qT)
+        qkT_scaled = qkT * sm_scale
+        qkT_scaled_bias = qkT_scaled + b_pwT
+        aT = qkT_scaled_bias * INV_LN2
+        # * sm_scale -> * bias -> * 1/log(2), which is what lse has built in.
+
+        # Recompute attention probabilities using cached logsumexp values
+        # Careful to use exp2 here and lse along the Q dimension (which is last because of inverse)
+        pT = tl.math.exp2(aT - lse[None, :])
+
+        do = tl.load(do_ptrs)
+
+        ppT = pT.to(tl.float16)
+        dv += tl.dot(ppT, do)
+
+        # Compute dP (gradient of probabilities) and dS (gradient of scores)
+        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+        dsT = pT * (dpT - Di[None, :])
+        dsT = dsT.to(tl.float16)
+
+        # Compute dK gradients
+        dk += tl.dot(dsT, tl.trans(qT))
+
+        # Update pointers for next iteration
+        curr_ql2 += step_ql2
+        qT_ptrs += step_ql2 * stride_l2
+        do_ptrs += step_ql2 * stride_l2
+        b_pw_ptrs += step_ql2 * stride_b_pw_l1
+
+    return dk, dv
+
+
+@triton.jit
+def _attn_bwd_dq_db_pw(dq, dB_pw_start, #
+                 q, K, V, B_pw_dq_start, sm_scale, #
+                 do, lse, OdO,  #
+                 stride_l2, stride_d,  #
+                 H, L,  #
+                 stride_b_pw_l1, stride_b_pw_l2,  #
+                 BLOCK_QL2: tl.constexpr,  #
+                 BLOCK_KL2: tl.constexpr,  #
+                 HEAD_DIM: tl.constexpr,  #
+        ):
+    """
+    Computes gradients with respect to queries (dq)--each warp/program
+    loops over the KV sequence dimension, and accumulates dq in sram.
+    """
+    # Initialize offsets for the current block
+    offs_ql2 = tl.arange(0, BLOCK_QL2)
+    offs_kl2 = tl.arange(0, BLOCK_KL2)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    # Setup pointers for K and V tensors
+    kT_ptrs = K + offs_kl2[None, :] * stride_l2 + offs_d[:, None] * stride_d
+    vT_ptrs = V + offs_kl2[None, :] * stride_l2 + offs_d[:, None] * stride_d
+    b_pw_ptrs = B_pw_dq_start + offs_kl2[None, :] * stride_b_pw_l2
+    db_pw_ptrs = dB_pw_start + offs_kl2[None, :] * stride_b_pw_l2
+
+    # Load precomputed deltas
+    Di = tl.load(OdO + offs_ql2)
+
+    # Ensure block sizes are compatible
+    tl.static_assert(BLOCK_QL2 % BLOCK_KL2 == 0)
+
+    # Initialize tracking variables
+    curr_kl2 = 0
+    step_kl2 = BLOCK_KL2
+
+    # Can't combine these two constants in the forward pass
+    # because of the bias, but the bias doesn't imapct the
+    # gradient so we do the computation first here.
+    SM_SCALE_INV_LN2 = sm_scale * INV_LN2
+
+    while curr_kl2 < L:
+        kT = tl.load(kT_ptrs)
+        vT = tl.load(vT_ptrs)
+        b_pw = tl.load(b_pw_ptrs)
+
+        # Compute attention scores
+        qk = tl.dot(q, kT)
+        qk_scaled = qk * sm_scale
+        qk_scaled_bias = qk_scaled + b_pw
+        a = qk_scaled_bias * INV_LN2
+
+        # Note that lse is actually log2sumexp
+        p = tl.math.exp2(a - lse)
+
+        # Compute gradients
+        dp = tl.dot(do, vT).to(tl.float32)  # Gradient wrt attention probabilities
+        da = p * (dp - Di[:, None])  # Gradient wrt attention scores
+        da = da.to(tl.float16)
+        tl.atomic_add(db_pw_ptrs, da)
+
+        # Update query gradients
+        # SM scale, and LN2
+        dq += tl.dot(da, tl.trans(kT)) * SM_SCALE_INV_LN2
+
+        # Update pointers for next iteration
+        curr_kl2 += step_kl2
+        kT_ptrs += step_kl2 * stride_l2
+        vT_ptrs += step_kl2 * stride_l2
+        b_pw_ptrs += step_kl2 * stride_b_pw_l2
+        db_pw_ptrs += step_kl2 * stride_b_pw_l2
+
+    return dq
+
+
+@triton.jit
+def _attn_bwd(Q, K, V, B_pw, sm_scale,  #
+              DO,  #
+              DQ, DK, DV, DB_pw, #
+              Logsumexp, OdO,
+              # shared by Q/K/V/DO.
+              stride_b, stride_h, stride_l1, stride_l2, stride_d,  #
+              stride_b_pw_b, stride_b_pw_h, stride_b_pw_l1, stride_b_pw_l2,  #
+              H, L,  #
+              DKDV_BLOCK_QL2: tl.constexpr,  #
+              DKDV_BLOCK_KL2: tl.constexpr,  #
+              DQ_BLOCK_QL2: tl.constexpr,  #
+              DQ_BLOCK_KL2: tl.constexpr,  #
+              HEAD_DIM: tl.constexpr):
+
+    bhl1_id = tl.program_id(2)
+    off_l1_2d = bhl1_id % L
+    bh1_id = bhl1_id // L
+    off_h_2d = bh1_id % H
+    off_b_2d = bh1_id // H
+
+    # For the 1d logsumexp and OdO tensors, assume stride of 1
+    off_bh_1d = (bhl1_id * L).to(tl.int64)
+    adj = stride_b * off_b_2d + stride_h * off_h_2d + stride_l1 * off_l1_2d
+
+    # b_pw doesn't batch across l1 dimension
+    # TODO: performance optimization opportunity here to group
+    # l1 programs close together to increase L2 hit rate?
+    offs_b_pw = stride_b_pw_b * off_b_2d + stride_b_pw_h * off_h_2d
+    pid = tl.program_id(0)
+
+    # offset pointers for batch/head
+    Q += adj
+    K += adj
+    V += adj
+    DO += adj
+    DQ += adj
+    DK += adj
+    DV += adj
+    DB_pw += offs_b_pw
+    B_pw += offs_b_pw
+    Logsumexp += off_bh_1d
+    OdO += off_bh_1d
+
+    # First, compute dK and dV by looping over the Q dimension and accumulating
+    # dkdv in sram.
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    start_kl2 = pid * DKDV_BLOCK_KL2
+
+    offs_kl2 = start_kl2 + tl.arange(0, DKDV_BLOCK_KL2)
+
+    dv = tl.zeros([DKDV_BLOCK_KL2, HEAD_DIM], dtype=tl.float32)
+    dk = tl.zeros([DKDV_BLOCK_KL2, HEAD_DIM], dtype=tl.float32)
+
+    # load K and V: they stay in SRAM throughout the inner loop.
+    k = tl.load(K + offs_kl2[:, None] * stride_l2 + offs_d[None, :] * stride_d)
+    v = tl.load(V + offs_kl2[:, None] * stride_l2 + offs_d[None, :] * stride_d)
+
+    # For dkdv, fix kv dimension and loop over b_pw_l1. Shape (KL2, 1)
+    B_pwT_dkdv_start = B_pw + offs_kl2[:, None] * stride_b_pw_l2
+
+    dk, dv = _attn_bwd_dkdv(dk, dv,  #
+                            Q, k, v, B_pwT_dkdv_start, sm_scale,  #
+                            DO,  #
+                            Logsumexp, OdO,  #
+                            stride_l2, stride_d,  #
+                            stride_b_pw_l1, stride_b_pw_l2,  #
+                            H, L,  #
+                            DKDV_BLOCK_QL2, DKDV_BLOCK_KL2, HEAD_DIM,  #
+                            )
+
+    dv_ptrs = DV + offs_kl2[:, None] * stride_l2 + offs_d[None, :] * stride_d
+    tl.store(dv_ptrs, dv)
+
+    # Write back dK.
+    dk *= sm_scale
+    dk_ptrs = DK + offs_kl2[:, None] * stride_l2 + offs_d[None, :] * stride_d
+    tl.store(dk_ptrs, dk)
+
+    # Compute dQ. Tile over Q dimension and loop over KV dimension.
+    start_ql2 = pid * DQ_BLOCK_QL2
+    offs_ql2 = start_ql2 + tl.arange(0, DQ_BLOCK_QL2)
+
+    q = tl.load(Q + offs_ql2[:, None] * stride_l2 + offs_d[None, :] * stride_d)
+    dq = tl.zeros([DQ_BLOCK_QL2, HEAD_DIM], dtype=tl.float32)
+    do = tl.load(DO + offs_ql2[:, None] * stride_l2 + offs_d[None, :] * stride_d)
+
+    lse = tl.load(Logsumexp + offs_ql2)
+    # (QL2, 1)
+    lse = lse[:, None]
+
+    B_pw_dq_start = B_pw + offs_ql2[:, None] * stride_b_pw_l1
+    dB_pw_start = DB_pw + offs_ql2[:, None] * stride_b_pw_l1
+
+    dq = _attn_bwd_dq_db_pw(dq, dB_pw_start, #
+                      q, K, V, B_pw_dq_start, sm_scale,  #
+                      do, lse, OdO,  #
+                      stride_l2, stride_d,  #
+                      H, L,  #
+                      stride_b_pw_l1, stride_b_pw_l2,  #
+                      DQ_BLOCK_QL2, DQ_BLOCK_KL2, HEAD_DIM,  #
+                      )
+    # Write back dQ.
+    dq_ptrs = DQ + offs_ql2[:, None] * stride_l2 + offs_d[None, :] * stride_d
+    dq *= LN2
+    tl.store(dq_ptrs, dq)
+
+
 
 class _attention(torch.autograd.Function):
     @staticmethod
@@ -268,14 +559,15 @@ class _attention(torch.autograd.Function):
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+        assert q.dtype == k.dtype == v.dtype == b_pw.dtype
+        dtype = q.dtype
 
         # Initialize output tensor
         o = torch.empty_like(q)
 
-        # Initialize scaling factor storage
-        # M is the max val for each query position--QL2.
-        # Shape (B, H, L1, L2), equivalent to attn_scores.max(dim=-1)
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2], q.shape[3]), device=q.device, dtype=torch.float32)
+        # Initialize storage for Logsumexp
+        # Shape (B, H, L1, L2)
+        Logsumexp = torch.empty((q.shape[0], q.shape[1], q.shape[2], q.shape[3]), device=q.device, dtype=torch.float32)
 
         def grid(args):
             return (triton.cdiv(q.shape[-2], args["BLOCK_QL2"]), q.shape[-3], q.shape[0] * q.shape[1])
@@ -284,27 +576,96 @@ class _attention(torch.autograd.Function):
 
         # Launch regular kernel
         _attn_fwd[grid](
-            q, k, v, b_pw, sm_scale, M, o,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3), k.stride(4),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3), v.stride(4),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3), o.stride(4),
-            b_pw.stride(0), b_pw.stride(1), b_pw.stride(2), b_pw.stride(3),
-            B=q.shape[0], H=q.shape[1], L=q.shape[2],
-            D=HEAD_DIM_K,
+            q, k, v, b_pw, sm_scale, Logsumexp, o,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3), k.stride(4),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3), v.stride(4),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3), o.stride(4),
+        b_pw.stride(0), b_pw.stride(1), b_pw.stride(2), b_pw.stride(3),
+        B=q.shape[0], H=q.shape[1], L=q.shape[2],
+        D=HEAD_DIM_K,
         )
 
         # Save tensors needed for backward pass
-        ctx.save_for_backward(q, k, v, o, M)
+        ctx.save_for_backward(q, k, v, o, b_pw, Logsumexp)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
+        ctx.dtype = dtype
         return o
+
+    @staticmethod
+    def backward(ctx, do):
+        dtype = ctx.dtype
+        assert do.dtype == dtype
+        # Retrieve saved tensors from forward pass
+        q, k, v, o, b_pw, logsumexp = ctx.saved_tensors
+
+
+        # Verify gradient tensor properties
+        assert do.is_contiguous()
+        # Note: b_pw doesn't have l1 dimension, so stride is different.
+        assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
+
+        # Initialize gradient tensors
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        # db_pw accumulated directly in HBM for now.
+        db_pw = torch.zeros_like(b_pw)
+
+        # Get tensor dimensions
+        B, H, L, L, D = q.shape
+
+        assert (L & (L - 1)) == 0, "L must be a power of 2"
+
+        # Define block sizes and parameters
+        PRE_BLOCK = min(L, 128)
+        NUM_WARPS, NUM_STAGES = 4, 5
+        DKDV_BLOCK_QL2, DKDV_BLOCK_KL2, DQ_BLOCK_QL2, DQ_BLOCK_KL2 = 32, 128, 128, 32
+        RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
+
+        # Verify context size is compatible with block size
+        assert L % PRE_BLOCK == 0
+
+        # Define preprocessing grid dimensions
+        pre_grid = (L // PRE_BLOCK, B * H * L)
+
+        # Initialize delta tensor for gradient computation
+        o_do = torch.empty_like(logsumexp)
+
+        # Preprocess gradients
+        _attn_bwd_preprocess[pre_grid](
+            o, do,
+            o_do,
+            B, H, L,
+            BLOCK_QL2=PRE_BLOCK, D=ctx.HEAD_DIM
+        )
+
+        # Define main backward pass grid dimensions
+        grid = (L // DKDV_BLOCK_KL2, 1, B * H * L)
+
+        # Compute gradients
+        _attn_bwd[grid](
+            q, k, v, b_pw, ctx.sm_scale, do, dq, dk, dv, db_pw,
+            logsumexp, o_do,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4),
+            b_pw.stride(0), b_pw.stride(1), b_pw.stride(2), b_pw.stride(3),
+            H=H, L=L,
+            DKDV_BLOCK_QL2=DKDV_BLOCK_QL2, DKDV_BLOCK_KL2=DKDV_BLOCK_KL2,
+            DQ_BLOCK_QL2=DQ_BLOCK_QL2, DQ_BLOCK_KL2=DQ_BLOCK_KL2,
+            HEAD_DIM=ctx.HEAD_DIM,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES
+        )
+
+        return dq, dk, dv, db_pw, None
+
 
 attention = _attention.apply
 
 
 @pytest.mark.parametrize("Z, H, L, HEAD_DIM", [(1, 2, 1024, 32)])
-def test_op(Z, H, L, HEAD_DIM, dtype=torch.float16):
+def test_op(B, H, L, HEAD_DIM, dtype=torch.float16):
     """
     Test function for attention implementation
     Compares Triton implementation with PyTorch reference implementation
@@ -313,40 +674,42 @@ def test_op(Z, H, L, HEAD_DIM, dtype=torch.float16):
     torch.manual_seed(20)
 
     # Initialize input tensors
-    q = (torch.empty((Z, H, L, L, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, L, L, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, L, L, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    b = (torch.empty((Z, H, L, L), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    q = (torch.empty((B, H, L, L, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    k = (torch.empty((B, H, L, L, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    v = (torch.empty((B, H, L, L, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    b_pw = (torch.empty((B, H, L, L), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     sm_scale = 0.5
     dout = torch.randn_like(q)
 
     
-    ref_out = reference_tt_attn(q, k, v, b, sm_scale)
+    ref_out = reference_tt_attn(q, k, v, b_pw, sm_scale)
 
     # Compute reference gradients
     ref_out.backward(dout)
     ref_dv, v.grad = v.grad.clone(), None
     ref_dk, k.grad = k.grad.clone(), None
     ref_dq, q.grad = q.grad.clone(), None
-    ref_db, b.grad = b.grad.clone(), None
+    ref_db_pw, b_pw.grad = b_pw.grad.clone(), None
 
     # Triton implementation
-    tri_out = attention(q, k, v, b, sm_scale).half()
+    tri_out = attention(q, k, v, b_pw, sm_scale).half()
 
     # Compare results--forward pass
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
 
-    backwards_pass_implemented = False
+    backwards_pass_implemented = True
     if backwards_pass_implemented:
         tri_out.backward(dout)
         tri_dv, v.grad = v.grad.clone(), None
         tri_dk, k.grad = k.grad.clone(), None
         tri_dq, q.grad = q.grad.clone(), None
+        tri_db_pw, b_pw.grad = b_pw.grad.clone(), None
 
         # Verify gradients match
         assert torch.allclose(ref_dv, tri_dv, atol=1e-2)
         assert torch.allclose(ref_dk, tri_dk, atol=1e-2)
         assert torch.allclose(ref_dq, tri_dq, atol=1e-2)
+        assert torch.allclose(ref_db_pw, tri_db_pw, atol=1e-2)
 
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
 # BATCH, N_HEADS, HEAD_DIM = 4, 32, 64 # To test on A100
@@ -354,9 +717,6 @@ B, H, D = 4, 8, 32 # To test on L4
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
-    if mode == "bwd":
-        continue
-    
     # Peak memory usage benchmark
     configs.append(
         triton.testing.Benchmark(
@@ -488,13 +848,13 @@ def reference_tt_attn(q, k, v, b, sm_scale):
 
     If a debugging_dict is provided, we will check intermediate values against the debugging_dict.
     """
-    Z, H, L = q.shape[:3]
+    B, H, L = q.shape[:3]
     # Step 1: QK^T. 
     qk = torch.matmul(q, k.transpose(-2, -1))
 
     # Step 2: Scale and add bias--attn scaling happens before bias addition
     qk_scaled = qk * sm_scale 
-    qk_scaled_bias = qk_scaled + b.view(Z, H, 1, L, L)
+    qk_scaled_bias = qk_scaled + b.view(B, H, 1, L, L)
 
     # Step 3a: Softmax (builtin)
     p = torch.softmax(qk_scaled_bias.float(), dim=-1).to(v.dtype)
@@ -505,7 +865,7 @@ def reference_tt_attn(q, k, v, b, sm_scale):
 
 if __name__ == "__main__":
     # Run basic correctness test
-    test_op(Z=2, H=4, L=128, HEAD_DIM=32, dtype=torch.float16)
+    test_op(B=2, H=4, L=128, HEAD_DIM=32, dtype=torch.float16)
 
     # Run benchmarks
     bench_attention.run(save_path="test_results/", print_data=True)
