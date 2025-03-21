@@ -11,6 +11,12 @@ representations (B, H, L, L, D), and a bias term over
 the attention weights, through which we wish to
 propagate gradients.
 
+### Roadmap
+- [ ] bf16 and fp32 support
+- [ ] attention weight dropout
+- [ ] Supporting for incoming edges (currently must manually permute and call kernel)
+- [ ] TMA support
+
 ### Input Format
 - Query (Q): `(Batch, Heads, L1, L2, Dims)`
 - Key (K): `(Batch, Heads, L1, L2, Dims)`
@@ -60,3 +66,21 @@ found [here](https://triton-lang.org/main/getting-started/tutorials/06-fused-att
 mechanism is based on the [AlphaFold2 paper](https://www.nature.com/articles/s41586-021-03819-2). This repository 
 is intended to be an open source reproduction of the flash
 triangular attention mechanism described in the [NeuralPLexer 3 paper](https://arxiv.org/abs/2412.10743)
+
+## Citation
+
+If you use this codebase, or otherwise found it useful, please cite:
+
+```bibtex
+@software{triangular_attention_triton,
+author = {Bryan Wu},
+title = {Triton Implementation of Triangular Attention},
+url = {https://github.com/bryanzwu/triangular-attention-triton},
+year = {2025},
+note = {An efficient implementation of triangular attention using Triton}
+}
+```
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
