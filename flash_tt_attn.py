@@ -291,7 +291,7 @@ def _attn_bwd_preprocess(O, DO,  #
 def _attn_bwd_dkdv(dk, dv,  #
                    Q, k, v, B_pwT_dkdv_start, sm_scale,  #
                    DO,  #
-                   Logsumexp, D,  #
+                   Logsumexp, OdO,  #
                    stride_l2, stride_d,  #
                    stride_b_pw_l1, stride_b_pw_l2,  #
                    H, L, BLOCK_QL2: tl.constexpr,  #
@@ -332,7 +332,7 @@ def _attn_bwd_dkdv(dk, dv,  #
         lse = tl.load(Logsumexp + offs_ql2_1d)
         qT = tl.load(qT_ptrs)
         b_pwT = tl.load(b_pw_ptrs)
-        Di = tl.load(D + offs_ql2_1d)
+        o_do = tl.load(OdO + offs_ql2_1d)
 
         # Rematerialize attention score in sram/registers
         qkT = tl.dot(k, qT)
@@ -352,7 +352,7 @@ def _attn_bwd_dkdv(dk, dv,  #
 
         # Compute dP (gradient of probabilities) and dS (gradient of scores)
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
-        dsT = pT * (dpT - Di[None, :])
+        dsT = pT * (dpT - o_do[None, :])
         dsT = dsT.to(tl.float16)
 
         # Compute dK gradients
@@ -370,7 +370,7 @@ def _attn_bwd_dkdv(dk, dv,  #
 @triton.jit
 def _attn_bwd_dq_db_pw(dq, dB_pw_start, #
                  q, K, V, B_pw_dq_start, sm_scale, #
-                 do, lse, OdO,  #
+                 do, lse, o_do,  #
                  stride_l2, stride_d,  #
                  H, L,  #
                  stride_b_pw_l1, stride_b_pw_l2,  #
@@ -392,9 +392,6 @@ def _attn_bwd_dq_db_pw(dq, dB_pw_start, #
     vT_ptrs = V + offs_kl2[None, :] * stride_l2 + offs_d[:, None] * stride_d
     b_pw_ptrs = B_pw_dq_start + offs_kl2[None, :] * stride_b_pw_l2
     db_pw_ptrs = dB_pw_start + offs_kl2[None, :] * stride_b_pw_l2
-
-    # Load precomputed deltas
-    Di = tl.load(OdO + offs_ql2)
 
     # Ensure block sizes are compatible
     tl.static_assert(BLOCK_QL2 % BLOCK_KL2 == 0)
@@ -424,7 +421,7 @@ def _attn_bwd_dq_db_pw(dq, dB_pw_start, #
 
         # Compute gradients
         dp = tl.dot(do, vT).to(tl.float32)  # Gradient wrt attention probabilities
-        da = p * (dp - Di[:, None])  # Gradient wrt attention scores
+        da = p * (dp - o_do[:, None])  # Gradient wrt attention scores
         da = da.to(tl.float16)
         tl.atomic_add(db_pw_ptrs, da)
 
@@ -537,9 +534,11 @@ def _attn_bwd(Q, K, V, B_pw, sm_scale,  #
     B_pw_dq_start = B_pw + offs_ql2[:, None] * stride_b_pw_l1
     dB_pw_start = DB_pw + offs_ql2[:, None] * stride_b_pw_l1
 
+    o_do = tl.load(OdO + offs_ql2)
+
     dq = _attn_bwd_dq_db_pw(dq, dB_pw_start, #
                       q, K, V, B_pw_dq_start, sm_scale,  #
-                      do, lse, OdO,  #
+                      do, lse, o_do,  #
                       stride_l2, stride_d,  #
                       H, L,  #
                       stride_b_pw_l1, stride_b_pw_l2,  #
@@ -866,7 +865,7 @@ def reference_tt_attn(q, k, v, b, sm_scale):
 
 if __name__ == "__main__":
     # Run basic correctness test
-    test_op(B=2, H=4, L=128, HEAD_DIM=32, dtype=torch.float16)
+    test_op(B=2, H=4, L=256, HEAD_DIM=32, dtype=torch.float16)
 
     # Run benchmarks
     # bench_attention.run(save_path="test_results/", print_data=True)
